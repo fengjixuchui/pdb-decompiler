@@ -1,7 +1,7 @@
 mod cpp;
 
 use pdb::FallibleIterator;
-use std::{collections::HashMap, error::Error, fs::{self, File, OpenOptions}, io::Write, num, path::PathBuf};
+use std::{collections::HashMap, error::Error, fs::{self, File, OpenOptions}, io::Write, num, path::{PathBuf, Path}};
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -17,11 +17,11 @@ struct Options {
     base_address: Option<u64>,
 }
 
-pub fn parse_base_address(src: &str) -> Result<u64, num::ParseIntError> {
+fn parse_base_address(src: &str) -> Result<u64, num::ParseIntError> {
     u64::from_str_radix(src.trim_start_matches("0x"), 16)
 }
 
-pub fn sanitize_path<S: AsRef<str>>(path: S) -> String {
+fn sanitize_path<S: AsRef<str>>(path: S) -> String {
     let mut result = path.as_ref().to_string().replace('\\', "/");
 
     if let Some((_, rest)) = result.split_once(':') {
@@ -31,49 +31,35 @@ pub fn sanitize_path<S: AsRef<str>>(path: S) -> String {
     result
 }
 
-pub fn canonicalize_file_path(out_path: &str, root_path: &str, path: &str) -> PathBuf {
+pub fn canonicalize_path(out_path: &str, root_path: &str, path: &str, is_directory: bool) -> PathBuf {
     let path = PathBuf::from(format!(
-        "{}/{}",
+        "{}/{}{}",
         out_path,
-        if path.contains(":") {
-            crate::sanitize_path(path)
+        if path.contains(':') {
+            sanitize_path(path)
         } else {
             format!("{}/{}", sanitize_path(root_path), sanitize_path(path))
         },
+        if is_directory { "/" } else { "" },
     ));
 
     if !path.exists() {
-        if let Some(parent_path) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent_path) {
-                panic!("Failed to create parent directories for file \"{}\": {e}", path.to_string_lossy());
+        if is_directory {
+            if !path.exists() {
+                if let Err(e) = fs::create_dir_all(path.clone()) {
+                    panic!("Failed to create directory \"{}\": {e}", path.to_string_lossy());
+                }
             }
-        }
-
-        if let Err(e) = File::create(path.clone()) {
-            panic!("Failed to create file \"{}\": {e}", path.to_string_lossy());
-        }
-    }
-
-    match path.canonicalize() {
-        Ok(x) => x.to_string_lossy().replace(out_path, "").into(),
-        Err(e) => panic!("Failed to canonicalize path \"{}\": {e}", path.to_string_lossy())
-    }
-}
-
-pub fn canonicalize_dir_path(out_path: &str, root_path: &str, path: &str) -> PathBuf {
-    let path = PathBuf::from(format!(
-        "{}/{}/",
-        out_path,
-        if path.contains(":") {
-            crate::sanitize_path(path)
         } else {
-            format!("{}/{}", sanitize_path(root_path), sanitize_path(path))
-        },
-    ));
-
-    if !path.exists() {
-        if let Err(e) = fs::create_dir_all(path.clone()) {
-            panic!("Failed to create directory \"{}\": {e}", path.to_string_lossy());
+            if let Some(parent_path) = path.parent() {
+                if let Err(e) = fs::create_dir_all(parent_path) {
+                    panic!("Failed to create parent directories for file \"{}\": {e}", path.to_string_lossy());
+                }
+            }
+    
+            if let Err(e) = File::create(path.clone()) {
+                panic!("Failed to create file \"{}\": {e}", path.to_string_lossy());
+            }
         }
     }
 
@@ -109,7 +95,7 @@ fn decompile_pdb(options: Options, mut pdb: pdb::PDB<File>) -> Result<(), Box<dy
 
     let mut modules = HashMap::new();
 
-    let out_path: PathBuf = options.out.ok_or("Out path not supplied".to_string())?;
+    let out_path: PathBuf = options.out.ok_or_else(|| "Out path not supplied".to_string())?;
     fs::create_dir_all(out_path.clone())?;
 
     let mut script_file = File::create(out_path.join("ida_script.py"))?;
@@ -131,14 +117,6 @@ fn decompile_pdb(options: Options, mut pdb: pdb::PDB<File>) -> Result<(), Box<dy
     )
     .map_err(|e| format!("failed to process id info: {e}"))?;
 
-    let section_contributions = load_section_contributions(&debug_info)
-        .map_err(|e| format!("does not contain module section information: {e}"))?;
-
-    let mut module_global_symbols = HashMap::new();
-
-    load_module_global_symbols(&debug_info, &global_symbols, &section_contributions, &mut module_global_symbols)
-        .map_err(|e| format!("failed to load module global symbol info: {e}"))?;
-
     process_modules(
         &out_path,
         machine_type,
@@ -147,14 +125,12 @@ fn decompile_pdb(options: Options, mut pdb: pdb::PDB<File>) -> Result<(), Box<dy
         &address_map,
         &string_table,
         &debug_info,
+        &global_symbols,
         &type_info,
         &type_finder,
-        &module_global_symbols,
         &mut modules,
         &mut script_file
-    )?;
-
-    Ok(())
+    )
 }
 
 fn load_section_contributions(
@@ -184,7 +160,7 @@ fn process_type_information<'a>(
 }
 
 fn process_id_information<'a>(
-    out_path: &PathBuf,
+    out_path: &Path,
     machine_type: pdb::MachineType,
     string_table: &pdb::StringTable,
     id_info: &'a pdb::IdInformation,
@@ -211,7 +187,7 @@ fn process_id_information<'a>(
                 let mut module = cpp::Module::default();
                 module.add_build_info(out_path, id_finder, build_info)?;
 
-                let module_path = module.path.to_string_lossy().trim_start_matches("/").to_lowercase().to_string();
+                let module_path = module.path.to_string_lossy().trim_start_matches('/').to_lowercase().to_string();
                 
                 if let Some(old_module) = modules.insert(module_path.clone(), module) {
                     let module = modules.get_mut(&module_path).unwrap();
@@ -238,8 +214,8 @@ fn process_id_information<'a>(
                 };
 
                 modules
-                    .entry(module_path.trim_start_matches("/").to_lowercase())
-                    .or_insert(cpp::Module::default().with_path(module_path.into()))
+                    .entry(module_path.trim_start_matches('/').to_lowercase())
+                    .or_insert_with(|| cpp::Module::default().with_path(module_path.into()))
                     .add_type_definition(machine_type, type_info, type_finder, data.udt, data.line)?;
             }
 
@@ -253,11 +229,13 @@ fn process_id_information<'a>(
 fn load_module_global_symbols<'a>(
     debug_info: &pdb::DebugInformation,
     global_symbols: &'a pdb::SymbolTable,
-    section_contributions: &Vec<pdb::DBISectionContribution>,
-    module_global_symbols: &mut HashMap<String, Vec<pdb::SymbolData<'a>>>,
-) -> pdb::Result<()> {
+) -> Result<HashMap<String, Vec<pdb::SymbolData<'a>>>, Box<dyn Error>> {
+    let section_contributions = load_section_contributions(debug_info)?;
+
     let modules = debug_info.modules()?.collect::<Vec<_>>()?;
     let mut prev_module_name = None;
+
+    let mut module_global_symbols = HashMap::new();
 
     let mut global_symbols_iter = global_symbols.iter();
 
@@ -276,18 +254,18 @@ fn load_module_global_symbols<'a>(
 
                 // println!("Inserting global UDT into previous module \"{module_name}\": {symbol_data:#?}");
 
-                module_global_symbols.entry(module_name).or_insert(vec![]).push(symbol_data.clone());
+                module_global_symbols.entry(module_name).or_insert_with(Vec::new).push(symbol_data.clone());
             }
 
             pdb::SymbolData::ProcedureReference(pdb::ProcedureReferenceSymbol { module: Some(module), .. }) => {
-                let referenced_module = modules.iter().nth(module as _).unwrap();
+                let referenced_module = modules.get(module as usize).unwrap();
 
                 let module_name = referenced_module.module_name().to_string();
                 prev_module_name = Some(module_name.clone());
 
                 // println!("Found referenced module \"{module_name}\" in global symbol {symbol_data:#?}");
 
-                module_global_symbols.entry(module_name).or_insert(vec![]).push(symbol_data.clone());
+                module_global_symbols.entry(module_name).or_insert_with(Vec::new).push(symbol_data.clone());
             }
 
             pdb::SymbolData::Public(pdb::PublicSymbol { offset, .. })
@@ -295,7 +273,7 @@ fn load_module_global_symbols<'a>(
             | pdb::SymbolData::ThreadStorage(pdb::ThreadStorageSymbol { offset, .. })
             | pdb::SymbolData::Procedure(pdb::ProcedureSymbol { offset, .. }) => {
                 for contribution in section_contributions.iter() {
-                    let contributing_module = modules.iter().nth(contribution.module as _).unwrap();
+                    let contributing_module = modules.get(contribution.module as usize).unwrap();
 
                     if offset >= contribution.offset && offset < contribution.offset + contribution.size {
                         let module_name = contributing_module.module_name().to_string();
@@ -303,7 +281,7 @@ fn load_module_global_symbols<'a>(
 
                         // println!("Found contributing module \"{module_name}\" in global symbol {symbol_data:#?}");
 
-                        module_global_symbols.entry(module_name).or_insert(vec![]).push(symbol_data.clone());
+                        module_global_symbols.entry(module_name).or_insert_with(Vec::new).push(symbol_data.clone());
                         break;
                     }
                 }
@@ -317,23 +295,26 @@ fn load_module_global_symbols<'a>(
         }
     }
 
-    Ok(())
+    Ok(module_global_symbols)
 }
 
-fn process_modules(
-    out_path: &PathBuf,
+fn process_modules<'a>(
+    out_path: &Path,
     machine_type: pdb::MachineType,
     base_address: Option<u64>,
     pdb: &mut pdb::PDB<File>,
     address_map: &pdb::AddressMap,
     string_table: &pdb::StringTable,
     debug_info: &pdb::DebugInformation,
+    global_symbols: &'a pdb::SymbolTable,
     type_info: &pdb::TypeInformation,
     type_finder: &pdb::TypeFinder,
-    module_global_symbols: &HashMap<String, Vec<pdb::SymbolData>>,
     modules: &mut HashMap<String, cpp::Module>,
     script_file: &mut File,
 ) -> Result<(), Box<dyn Error>> {
+    let module_global_symbols = load_module_global_symbols(debug_info, global_symbols)
+        .map_err(|e| format!("failed to load module global symbol info: {e}"))?;
+
     let mut module_iter = debug_info.modules().map_err(|e| format!("does not contain debug module info: {e}"))?;
 
     while let Some(ref module) = module_iter.next().map_err(|e| format!("failed to get next debug module info: {e}"))? {
@@ -352,7 +333,7 @@ fn process_modules(
             string_table,
             type_info,
             type_finder,
-            module_global_symbols,
+            &module_global_symbols,
             modules,
             script_file,
             module,
@@ -374,14 +355,14 @@ fn process_modules(
         let mut headers = vec![];
 
         for (header_path, is_global) in module.headers.iter() {
-            let path = header_path.to_string_lossy().trim_start_matches("/").to_lowercase().to_string();
+            let path = header_path.to_string_lossy().trim_start_matches('/').to_lowercase().to_string();
 
             if !module_paths.contains(&path) && !new_modules.contains_key(&path) {
                 new_modules.insert(path.clone(), cpp::Module::default().with_path(header_path.clone()));
             }
 
             if let Some(pch_file_name) = module.pch_file_name.as_ref() {
-                let pch_file_name = pch_file_name.to_string_lossy().trim_start_matches("/").to_lowercase().to_string();
+                let pch_file_name = pch_file_name.to_string_lossy().trim_start_matches('/').to_lowercase().to_string();
                 if path == pch_file_name {
                     continue;
                 }
@@ -390,7 +371,7 @@ fn process_modules(
             let mut modified_path = None;
 
             for dir_path in module.additional_include_dirs.iter() {
-                let dir_path = dir_path.to_string_lossy().trim_start_matches("/").to_lowercase().to_string();
+                let dir_path = dir_path.to_string_lossy().trim_start_matches('/').to_lowercase().to_string();
                 let dir_path_len = dir_path.len();
 
                 if dir_path_len < path.len() && path.starts_with(dir_path.as_str()) {
@@ -401,7 +382,7 @@ fn process_modules(
 
             headers.push(match modified_path {
                 Some(x) => x,
-                None => (header_path.clone(), is_global.clone()),
+                None => (header_path.clone(), *is_global),
             });
         }
 
@@ -410,9 +391,7 @@ fn process_modules(
     }
 
     for (k, v) in new_modules {
-        if !modules.contains_key(&k) {
-            modules.insert(k, v);
-        }
+        modules.entry(k).or_insert(v);
     }
 
     //
@@ -420,7 +399,7 @@ fn process_modules(
     //
 
     for (module_path, module) in modules {
-        let path = PathBuf::from(sanitize_path(format!("{}{}", out_path.to_string_lossy(), module_path).to_string()));
+        let path = PathBuf::from(sanitize_path(format!("{}{}", out_path.to_string_lossy(), module_path)));
 
         if let Some(parent_path) = path.parent() {
             fs::create_dir_all(parent_path)?;
@@ -492,16 +471,14 @@ fn process_module(
 
     while let Some(line) = lines.next()? {
         let file = line_program.get_file_info(line.file_index)?;
-        let offsets = line_offsets.entry(file.name).or_insert(HashMap::new());
+        let offsets = line_offsets.entry(file.name).or_insert_with(HashMap::new);
 
-        if !offsets.contains_key(&line.offset) {
-            offsets.insert(line.offset, line);
-        }
+        offsets.entry(line.offset).or_insert(line);
     }
 
-    let mut files = line_program.files();
+    let files = line_program.files().collect::<Vec<_>>()?;
 
-    while let Some(file) = files.next()? {
+    for file in &files {
         let path = PathBuf::from(sanitize_path(&file.name.to_string_lossy(string_table)?));
 
         match path.extension() {
@@ -580,12 +557,12 @@ fn process_module(
     }
 
     let path = PathBuf::from(module_file_path);
-    let source_file = path.to_string_lossy().trim_start_matches("/").to_lowercase();
+    let source_file = path.to_string_lossy().trim_start_matches('/').to_lowercase();
 
     let mut module_headers = vec![];
 
     for path in headers.iter() {
-        let source_file = path.to_string_lossy().trim_start_matches("/").to_lowercase().to_string();
+        let source_file = path.to_string_lossy().trim_start_matches('/').to_lowercase().to_string();
 
         if !modules.contains_key(&source_file) {
             modules.insert(source_file.clone(), cpp::Module::default().with_path(path.clone()));
@@ -594,7 +571,7 @@ fn process_module(
         module_headers.push((path.clone(), false));
     }
 
-    let module = modules.entry(source_file).or_insert(cpp::Module::default().with_path(path));
+    let module = modules.entry(source_file).or_insert_with(|| cpp::Module::default().with_path(path));
     
     for header in module_headers {
         if !module.headers.contains(&header) {
@@ -603,8 +580,8 @@ fn process_module(
     }
 
     for (path, member) in members {
-        let source_file = path.to_string_lossy().trim_start_matches("/").to_lowercase().to_string();
-        let module = modules.entry(source_file).or_insert(cpp::Module::default().with_path(path));
+        let source_file = path.to_string_lossy().trim_start_matches('/').to_lowercase().to_string();
+        let module = modules.entry(source_file).or_insert_with(|| cpp::Module::default().with_path(path));
 
         // TODO: check if module already contains member...
         module.members.push(member);
